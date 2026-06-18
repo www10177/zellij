@@ -22,6 +22,19 @@
     </head>
     <body data-authenticated="IS_AUTHENTICATED">
         <div id="terminal" tabindex="0"></div>
+        <form id="web-input-bar" autocomplete="off">
+            <textarea
+                id="web-command-input"
+                placeholder="Type here..."
+                aria-label="Web input"
+                rows="1"
+            ></textarea>
+            <label id="web-command-enter-toggle">
+                <input id="web-command-send-enter" type="checkbox" checked />
+                <span>Enter</span>
+            </label>
+            <button id="web-command-submit" type="submit">Send</button>
+        </form>
         <script src="assets/modals.js"></script>
         <!-- Module files - order matters -->
         <script type="module" src="assets/utils.js"></script>
