@@ -1,0 +1,13 @@
+[Unit]
+Description=Zellij Web Server
+Documentation=https://zellij.dev/documentation/web-client.html
+
+[Service]
+Type=simple
+ExecStart=/home/www10177/.local/bin/zellij web --ip 192.168.88.187 --port 8084 --cert /home/www10177/.config/zellij/certs/zellij-web.crt --key /home/www10177/.config/zellij/certs/zellij-web.key
+Restart=always
+RestartSec=5
+WorkingDirectory=/home/www10177
+
+[Install]
+WantedBy=default.target

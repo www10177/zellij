@@ -187,7 +187,7 @@ export function setupInputHandlers(term, sendFunction) {
  * Install the IME-bypass input listener exactly once per page load.
  * The send-function reference is refreshed on every call so the real
  * WebSocket sender (installed after initWebSockets) replaces the initial
- * placeholder — see index.js where setupInputHandlers is called twice.
+ * placeholder.
  */
 function installImeBypass(term, sendFunction) {
     if (typeof window.__zjImeBypass === "undefined") {
@@ -213,6 +213,10 @@ function installImeBypass(term, sendFunction) {
         "keydown",
         (ev) => {
             state.lastKeyWasProcess = ev.key === "Process";
+            if (state.lastKeyWasProcess) {
+                ev.preventDefault();
+                ev.stopImmediatePropagation();
+            }
         },
         true
     );
@@ -236,6 +240,8 @@ function installImeBypass(term, sendFunction) {
                     ev.data
                 ) {
                     state.sendFn(ev.data);
+                    ev.preventDefault();
+                    ev.stopImmediatePropagation();
                     // Clear so xterm.js's composition diff at compositionend
                     // finds no text to emit — prevents double-send.
                     ev.target.value = "";

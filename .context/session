@@ -1,0 +1,254 @@
+# Zellij Web Double Input Bug Debugging Session
+
+## 1. 問題描述 (Issue Description)
+* **症狀**：在 Zellij Web 網頁端輸入任何字元（例如 `ls`），在終端機內會被重複輸入，呈現雙送現象（例如變成 `<llss>`）。
+* **先前假設**：瀏覽器/xterm 的 keydown 事件與 IME bypass 的 input 事件重複觸發並傳送了兩次。但先前在 `input.js` 加上 `Process` 鍵的 `preventDefault()` 與攔截處理並未解決此問題。
+
+## 2. 驗證與調查發現 (Research Findings)
+
+為了釐清重複的來源，我們在前端與後端核心的多個組件邊界加上了詳細的除錯日誌（Console Log 及 `log::info!`）：
+
+### A. 瀏覽器前端調查（`input.js`, `websockets.js`）
+* **測試方式**：在前端加上 keydown、customKeyEventHandler、`term.onData` 以及 `websockets.js` 的 `wsTerminal.send` 記錄。
+* **發現**：使用者輸入 `ls` 後，瀏覽器 Console Log 顯示：
+  * `document keydown: l Process?: false`
+  * `custom key event` 觸發一次
+  * `term.onData` 觸發一次（內容為 `"l"`）
+  * `WebSocket sending` 傳送一次（內容為 `"l"`）
+  * 後續的 `s` 亦是同樣的單次觸發序列。
+* **結論**：**瀏覽器前端並未重複發送按鍵事件**，每次按鍵確實只透過 WebSocket 送出一次。
+
+### B. 伺服器端 WebSocket 接收與解析層（`websocket_handlers.rs`, `message_handlers.rs`）
+* **測試方式**：在 `websocket_handlers.rs` 的 `handle_ws_terminal` 訊息接收迴圈，以及 `message_handlers.rs` 的 `parse_stdin` 轉發點加入 `log::info!`。
+* **發現**：伺服器端日誌顯示：
+  ```
+  WS rx Text for web_client_id ... : Utf8Bytes(Utf8Bytes(b"l"))
+  parse_stdin (normal): sending Key to server: KeyWithModifier { bare_key: Char('l'), ... }
+  WS rx Text for web_client_id ... : Utf8Bytes(Utf8Bytes(b"s"))
+  parse_stdin (normal): sending Key to server: KeyWithModifier { bare_key: Char('s'), ... }
+  ```
+* **結論**：伺服器 WebSocket 接收層與標準輸入解析層**只收到並解析了各一次按鍵事件**，並轉發至核心。重複傳送並非發生在此處。
+
+### C. 伺服器核心到 PTY 寫入層（當前進度）
+* **當前修改**：我們在 `zellij-server/src/pty_writer.rs` 的 `write_to_tty_stdin` 寫入點加入了日誌：
+  ```rust
+  log::info!("pty_writer writing to tty {} stdin: {:?}", tid, remaining);
+  ```
+* **編譯環境**：已成功配置好完整的開發快取（DEV/Debug 版本，使用 `cargo xtask build` 建置），未來的 DEV 增量編譯將非常快速。
+
+## 3. 下一步行動指南 (Next Steps)
+1. 啟動 `zellij-web.service`。
+2. 請使用者在網頁端輸入 `ls` 進行測試。
+3. 檢查伺服器端日誌 `/tmp/zellij-1000/zellij-log/zellij.log`：
+   * **情境一**：如果日誌顯示 `pty_writer writing to tty ...` 針對每個按鍵出現了**兩次**，代表 Zellij Server 核心在處理 `ClientToServerMsg::Key` 或路由 Action 時發生了重複分發。
+   * **情境二**：如果日誌顯示只寫入 PTY **一次**，代表問題出在 PTY 本身的 Echo（回顯）設定、或者是伺服器把 PTY 輸出傳回給客戶端時處理了兩次，或者是 xterm.js 前端處理回顯時繪製了兩次。
+
+## 4. Codex handoff update - 2026-06-19 14:00 CST
+
+After reviewing `.context/session`, `git diff`, the deployed binary, and the user service state, the strongest root-cause candidate is no longer the PTY writer path. The source diff showed that `zellij-client/assets/index.js` originally called `setupInputHandlers(term, sendAnsiKey)` twice:
+
+1. once before `initWebSockets`, with a placeholder `sendAnsiKey`;
+2. again after `initWebSockets`, with `websockets.sendAnsiKey`.
+
+That pattern registers duplicate xterm/input event handlers. A single keypress can therefore run through multiple handlers even when later instrumentation shows only one useful WebSocket send after the cleanup.
+
+Current retained fix:
+
+```js
+let sendAnsiKeyImpl = (ansiKey) => {};
+let sendAnsiKey = (ansiKey) => sendAnsiKeyImpl(ansiKey);
+
+setupInputHandlers(term, sendAnsiKey);
+
+const websockets = initWebSockets(webClientId, sessionName, term, fitAddon, sendAnsiKey);
+sendAnsiKeyImpl = websockets.sendAnsiKey;
+```
+
+This keeps only one input-handler registration and swaps the implementation behind a stable wrapper after the WebSocket sender exists.
+
+Cleanup performed:
+
+- Removed temporary browser `console.log` instrumentation from `input.js` and `websockets.js`.
+- Removed temporary server `log::info!` instrumentation from:
+  - `zellij-client/src/web_client/message_handlers.rs`
+  - `zellij-client/src/web_client/websocket_handlers.rs`
+  - `zellij-server/src/pty_writer.rs`
+- Kept the IME bypass functional guard that prevents/default-stops `Process` key input and textarea insert events after the bypass sends the intended character.
+
+Deployment status:
+
+- Rebuilt with `cargo xtask build`; cached plugin build completed quickly, `dev-opt` build completed successfully.
+- Replaced `/home/www10177/.local/bin/zellij`.
+- Restarted `zellij-web.service`.
+- Verified service is active and running:
+  - command: `/home/www10177/.local/bin/zellij web --ip 192.168.88.187 --port 8084 ...`
+  - endpoint check: `curl -k -I https://192.168.88.187:8084/` returned `HTTP/2 200`.
+
+Remaining dirty tree notes:
+
+- Source changes now intentionally remain in:
+  - `zellij-client/assets/index.js`
+  - `zellij-client/assets/input.js`
+- `cargo xtask build` also changed bundled plugin `.wasm` files under `zellij-utils/assets/plugins/*.wasm`. These are build artifacts from the local build and should be reviewed separately before committing.
+
+Recommended next validation:
+
+1. Hard reload the Zellij Web page to avoid stale JS.
+2. Type `ls` in the web terminal.
+3. If the double-input symptom is gone, the root cause was the double `setupInputHandlers` registration in `index.js`.
+4. If the symptom remains, inspect output-side duplication next:
+   - `zellij-client/src/web_client/message_handlers.rs::render_to_client`
+   - `zellij-client/src/web_client/connection_manager.rs::send_stdout`
+   - `zellij-client/assets/websockets.js` `wsTerminal.onmessage -> term.write(data)`
+
+## 5. Shell/prompt hypothesis - 2026-06-19
+
+User observed that Bash behaves correctly while Zsh/OMZ appears to have prompt/input rendering issues. Local shell config review supports this as a plausible next root cause:
+
+- `~/.zshrc` uses Oh My Zsh with `ZSH_THEME="powerlevel10k/powerlevel10k"`.
+- OMZ plugins include `zsh-autosuggestions`.
+- `zsh-syntax-highlighting` is sourced after OMZ.
+- `~/.p10k.zsh` was generated with:
+  - `transient_prompt`
+  - `instant_prompt=verbose`
+  - multiline prompt
+  - right prompt
+  - VCS/gitstatus integration
+
+These features emit frequent cursor movement, prompt clearing/redrawing, OSC prompt markers, right-prompt updates, and async gitstatus updates. If Bash is stable, the issue may be output/prompt redraw compatibility rather than keyboard input duplication.
+
+Temporary Zsh test profiles were created under `/tmp/zellij-zsh-tests` without modifying the real `~/.zshrc`:
+
+```text
+/tmp/zellij-zsh-tests/minimal/.zshrc
+/tmp/zellij-zsh-tests/omz-basic/.zshrc
+/tmp/zellij-zsh-tests/p10k-current/.zshrc
+/tmp/zellij-zsh-tests/p10k-no-dynamic/.zshrc
+```
+
+Run these inside Zellij Web:
+
+```sh
+exec env ZDOTDIR=/tmp/zellij-zsh-tests/minimal zsh -i
+exec env ZDOTDIR=/tmp/zellij-zsh-tests/omz-basic zsh -i
+exec env ZDOTDIR=/tmp/zellij-zsh-tests/p10k-no-dynamic zsh -i
+exec env ZDOTDIR=/tmp/zellij-zsh-tests/p10k-current zsh -i
+```
+
+Interpretation:
+
+- `minimal` works, `omz-basic` fails: OMZ or basic ZLE plugin behavior is enough to trigger it.
+- `omz-basic` works, `p10k-current` fails: Powerlevel10k/prompt rendering is the likely culprit.
+- `p10k-no-dynamic` works, `p10k-current` fails: focus on P10k instant prompt, transient prompt, right prompt, or async VCS/gitstatus.
+- all Zsh profiles fail while Bash works: inspect Zsh ZLE/bracketed paste/terminal capability interaction.
+
+Likely mitigation if P10k is confirmed:
+
+- For Zellij Web only, use a simpler Zsh profile through `ZDOTDIR` or set `default_shell` to a wrapper.
+- Alternatively adjust real P10k config:
+  - `POWERLEVEL9K_INSTANT_PROMPT=off`
+  - `POWERLEVEL9K_TRANSIENT_PROMPT=off`
+  - remove/disable right prompt elements
+  - temporarily remove `zsh-autosuggestions`
+
+## 6. Narrowed result - only p10k-current fails
+
+User tested the first matrix and reported:
+
+```sh
+exec env ZDOTDIR=/tmp/zellij-zsh-tests/p10k-current zsh -i
+```
+
+Only `p10k-current` reproduces the issue. This means plain Zsh, basic OMZ, and the earlier `p10k-no-dynamic` profile are not enough to trigger it.
+
+Additional single-variable profiles were created:
+
+```text
+/tmp/zellij-zsh-tests/p10k-no-instant
+/tmp/zellij-zsh-tests/p10k-no-transient
+/tmp/zellij-zsh-tests/p10k-no-right
+/tmp/zellij-zsh-tests/p10k-no-vcs
+/tmp/zellij-zsh-tests/p10k-no-autosuggest
+/tmp/zellij-zsh-tests/p10k-no-syntax
+```
+
+Run inside Zellij Web:
+
+```sh
+exec env ZDOTDIR=/tmp/zellij-zsh-tests/p10k-no-instant zsh -i
+exec env ZDOTDIR=/tmp/zellij-zsh-tests/p10k-no-transient zsh -i
+exec env ZDOTDIR=/tmp/zellij-zsh-tests/p10k-no-right zsh -i
+exec env ZDOTDIR=/tmp/zellij-zsh-tests/p10k-no-vcs zsh -i
+exec env ZDOTDIR=/tmp/zellij-zsh-tests/p10k-no-autosuggest zsh -i
+exec env ZDOTDIR=/tmp/zellij-zsh-tests/p10k-no-syntax zsh -i
+```
+
+Interpretation:
+
+- `p10k-no-instant` works: P10k instant prompt is involved.
+- `p10k-no-transient` works: transient prompt redraw is involved.
+- `p10k-no-right` works: right prompt rendering is involved.
+- `p10k-no-vcs` works: VCS/gitstatus async updates are involved.
+- `p10k-no-autosuggest` works: zsh-autosuggestions interaction is involved.
+- `p10k-no-syntax` works: syntax-highlighting interaction is involved.
+
+If several profiles work, prefer disabling the smallest visible feature first for the Zellij Web-specific shell profile, not the global terminal profile.
+
+## 7. Adopted mitigation - Web/remote-specific Zsh profile and layout
+
+The user reported that the narrowed P10k variants were still not normal enough, but a limited Zsh profile is acceptable for Zellij Web/remote use.
+
+Implemented a Web-only split so local Zellij keeps using the existing config/layout:
+
+```text
+/home/www10177/.config/zellij/config.kdl                 # unchanged local/default config
+/home/www10177/.config/zellij/layouts/codex.kdl          # unchanged local/default layout
+/home/www10177/.config/zellij/config-web.kdl             # Web service config
+/home/www10177/.config/zellij/layouts/codex-remote.kdl   # Web/remote layout
+/home/www10177/.config/zellij/web-shell/.zshrc           # simplified Web Zsh profile
+/home/www10177/.local/bin/zellij-web-zsh                 # wrapper: sets ZDOTDIR to web-shell
+/home/www10177/side_project/zellij/systemd/patch-zellij-web-shell.sh
+```
+
+`config-web.kdl` sets:
+
+```kdl
+default_shell "/home/www10177/.local/bin/zellij-web-zsh"
+default_layout "codex-remote"
+```
+
+`codex-remote.kdl` mirrors the current `codex.kdl` tab-bar, codex quota bar, and status-bar layout, but its initial pane explicitly runs:
+
+```kdl
+pane command="/home/www10177/.local/bin/zellij-web-zsh"
+```
+
+The Web shell profile intentionally does not load Powerlevel10k, Oh My Zsh, zsh-autosuggestions, or syntax highlighting. It keeps PATH, core aliases, nvm, zoxide, bun, editor settings, and a plain single-line prompt.
+
+The user systemd service now starts Zellij Web with the Web-specific config:
+
+```ini
+ExecStart=/home/www10177/.local/bin/zellij --config /home/www10177/.config/zellij/config-web.kdl web --ip 192.168.88.187 --port 8084 --cert /home/www10177/.config/zellij/certs/zellij-web.crt --key /home/www10177/.config/zellij/certs/zellij-web.key
+```
+
+Verification performed:
+
+```sh
+/home/www10177/.local/bin/zellij-web-zsh -ic 'echo ZDOTDIR=$ZDOTDIR; echo RPROMPT=${RPROMPT:-empty}; echo SHELL_MARK=$ZELLIJ_WEB_SHELL; alias Codex'
+/home/www10177/.local/bin/zellij --config /home/www10177/.config/zellij/config-web.kdl setup --check
+/home/www10177/.local/bin/zellij --config /home/www10177/.config/zellij/config-web.kdl --layout codex-remote setup --check
+systemctl --user status zellij-web.service --no-pager
+curl -k -I --max-time 10 https://192.168.88.187:8084/
+```
+
+Results:
+
+- `zellij-web-zsh` uses `ZDOTDIR=/home/www10177/.config/zellij/web-shell`.
+- `RPROMPT` is empty and `ZELLIJ_WEB_SHELL=1`.
+- `config-web.kdl` is well-defined according to `zellij setup --check`.
+- `zellij-web.service` is active and running with `--config /home/www10177/.config/zellij/config-web.kdl`.
+- Web endpoint returns HTTP/2 200.
+
+Operational note: restarting `zellij-web.service` can take up to the systemd stop timeout if an old attached Web session still has child `zellij --server` / `zsh -i` processes. This happened before and again during this patch; systemd eventually SIGKILLed the stale children and started the new service successfully.
+
+Follow-up: `systemd/patch-zellij-web-shell.sh` was updated to be self-contained. Re-running it recreates the Web shell wrapper, `codex-remote.kdl`, Web `.zshrc`, `config-web.kdl` patch, service ExecStart patch, daemon-reload, and service restart.
