@@ -29,6 +29,7 @@ function initWebInputBar(sendFunction, fitAddon) {
     const webInputBar = document.getElementById("web-input-bar");
     const webCommandInput = document.getElementById("web-command-input");
     const webCommandSendEnter = document.getElementById("web-command-send-enter");
+    const webCommandReplaceNewline = document.getElementById("web-command-replace-newline");
     if (!webInputBar || !webCommandInput) return;
 
     const fitTerminal = () => {
@@ -48,9 +49,17 @@ function initWebInputBar(sendFunction, fitAddon) {
         const text = webCommandInput.value;
         if (!text) return;
 
-        sendFunction(text.replace(/\r?\n/g, "\r"));
-        if (!webCommandSendEnter || webCommandSendEnter.checked) {
-            sendFunction("\r");
+        if (webCommandReplaceNewline && webCommandReplaceNewline.checked) {
+            sendFunction(text.replace(/\r?\n/g, " "));
+            if (!webCommandSendEnter || webCommandSendEnter.checked) {
+                sendFunction("\r");
+            }
+        } else {
+            // Bracketed Paste Mode
+            sendFunction("\x1b[200~" + text + "\x1b[201~");
+            if (!webCommandSendEnter || webCommandSendEnter.checked) {
+                sendFunction("\r");
+            }
         }
         webCommandInput.value = "";
         webCommandInput.focus();

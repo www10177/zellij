@@ -58,7 +58,8 @@ body {
     border-color: #7aa2f7;
 }
 
-#web-command-enter-toggle {
+#web-command-enter-toggle,
+#web-command-replace-newline-toggle {
     flex: 0 0 auto;
     display: flex;
     align-items: center;
