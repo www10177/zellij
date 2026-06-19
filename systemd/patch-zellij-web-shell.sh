@@ -5,11 +5,18 @@ CONFIG_DIR="${HOME}/.config/zellij"
 LOCAL_BIN="${HOME}/.local/bin"
 SERVICE_FILE="${HOME}/.config/systemd/user/zellij-web.service"
 WEB_CONFIG="${CONFIG_DIR}/config-web.kdl"
-WEB_SHELL="${LOCAL_BIN}/zellij-web-zsh"
+WEB_SHELL="${CONFIG_DIR}/web-shell/zellij-web-zsh"
 WEB_ZSHRC="${CONFIG_DIR}/web-shell/.zshrc"
 WEB_LAYOUT="${CONFIG_DIR}/layouts/codex-remote.kdl"
 
+
 mkdir -p "${CONFIG_DIR}/web-shell" "${CONFIG_DIR}/layouts" "${LOCAL_BIN}"
+
+if [[ -f "${HOME}/.local/bin/zellij-web-zsh" ]]; then
+  echo "Cleaning up legacy shell wrapper at ~/.local/bin/..."
+  trash "${HOME}/.local/bin/zellij-web-zsh"
+fi
+
 
 cat > "${WEB_SHELL}" <<'EOF'
 #!/usr/bin/env sh
@@ -44,14 +51,20 @@ layout {
     }
 
     tab name="remote" {
-        pane command="/home/www10177/.local/bin/zellij-web-zsh"
+        pane command="/home/www10177/.config/zellij/web-shell/zellij-web-zsh"
     }
 }
 EOF
 
 cat > "${WEB_ZSHRC}" <<'EOF'
-# Zellij Web/remote shell profile.
-# Keep this prompt intentionally simple: no p10k, no instant prompt, no right prompt.
+# Zellij Web/remote shell profile with powerlevel10k (no-dynamic).
+
+export ZSH="$HOME/.oh-my-zsh"
+ZSH_THEME="powerlevel10k/powerlevel10k"
+plugins=(git)
+source "$ZSH/oh-my-zsh.sh"
+
+[[ ! -f /home/www10177/.config/zellij/web-shell/.p10k.zsh ]] || source /home/www10177/.config/zellij/web-shell/.p10k.zsh
 
 export LANG=en_US.UTF-8
 
@@ -63,9 +76,6 @@ export PATH="/home/www10177/.local/bin:$PATH"
 export PATH="${PATH}:/usr/local/cuda-13.3/bin"
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/cuda-13.3/lib64"
 export PATH="${PATH}:/home/www10177/5.MISC/utilities/bins"
-
-PROMPT='%F{green}%n@%m%f:%F{blue}%~%f %# '
-RPROMPT=''
 
 bindkey "\033[1~" beginning-of-line
 bindkey "\033[4~" end-of-line
@@ -119,11 +129,15 @@ export BUN_INSTALL="$HOME/.bun"
 export PATH="$BUN_INSTALL/bin:$PATH"
 EOF
 
+if [[ -f "/tmp/zellij-zsh-tests/p10k-no-dynamic/.p10k.zsh" ]]; then
+  cp -f "/tmp/zellij-zsh-tests/p10k-no-dynamic/.p10k.zsh" "${CONFIG_DIR}/web-shell/.p10k.zsh"
+fi
+
 if [[ ! -f "${WEB_CONFIG}" ]]; then
   cp "${CONFIG_DIR}/config.kdl" "${WEB_CONFIG}"
 fi
 
-perl -0pi -e 's{// default_shell "fish"}{default_shell "/home/www10177/.local/bin/zellij-web-zsh"}; s{default_layout "codex"}{default_layout "codex-remote"}' "${WEB_CONFIG}"
+perl -0pi -e 's{// default_shell "fish"}{default_shell "/home/www10177/.config/zellij/web-shell/zellij-web-zsh"}; s{default_layout "codex"}{default_layout "codex-remote"}' "${WEB_CONFIG}"
 
 chmod +x "${WEB_SHELL}"
 
